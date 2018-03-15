@@ -22,7 +22,7 @@ def create_output_folder(output_folder):
 
 def load_keras_model(model_json_file_path, weights_file_path):
 	# load keras model
-	with open(model_file_path, 'r') as json_file:
+	with open(model_json_file_path, 'r') as json_file:
 		loaded_model_json = json_file.read() # read json file
 		net_model = keras.models.model_from_json(loaded_model_json) # create model from json
 		net_model.load_weights(weights_file_path) # load weigths to model
@@ -34,15 +34,9 @@ def generate_nodes_names(basename, num_layer_nodes):
 	return [ basename + "_" + str(i) for i in range(num_layer_nodes) ]
 
 
-def set_input_node_names(net_model, node_names):
-	for i, node_name in enumerate(node_names):
-		tf.identity(net_model.inputs[i], name=node_name) # setup node name
-	return net_model
-
-
 def set_output_node_names(net_model, node_names):
 	for i, node_name in enumerate(node_names):
-		tf.identity(net_model.outputs[i], name=node_name) # setup node name
+		net_model.outputs[i] = tf.identity(net_model.outputs[i], name=node_name) # setup node name
 	return net_model
 
 
@@ -53,15 +47,13 @@ def write_graph_def_in_ascii(sess, output_folder):
 
 
 
-def set_model_node_names(net_model, input_nodes_name, output_nodes_name):
+def set_model_output_node_names(net_model, output_nodes_name):
 
-	input_nodes_names = generate_nodes_names(input_nodes_name, len(net_model.inputs))
 	output_nodes_names = generate_nodes_names(output_nodes_name, len(net_model.outputs))
 
-	net_model = set_input_node_names(net_model, input_nodes_names)
-	net_model = set_output_node_names(net_model, output_nodes_names)
+	new_net_model = set_output_node_names(net_model, output_nodes_names)
 
-	return net_model, input_nodes_names, output_nodes_names
+	return new_net_model, input_nodes_names, output_nodes_names
 
 
 def parse_args():
@@ -118,30 +110,69 @@ if __name__ == '__main__':
 
 	# load model from json file and load weigths
 	net_model = load_keras_model(ARGS.input_model, ARGS.input_weigths)
+	net_model.summary()
 
-	if net_model == None:
-		print('Model can not be loaded')
-		sys.exit()
+	assert net_model is not None, 'Model can not be loaded.'
 
 	# set names for input and output nodes of the model
-	net_model, input_nodes_names, output_nodes_names = set_model_node_names(net_model, ARGS.input_nodes_name, ARGS.output_nodes_name)
+	new_net_model, _, output_nodes_names = set_model_output_node_names(net_model, ARGS.output_nodes_name)
+
+	print ""
+	print "MODEL "
+	net_model.summary()
+	print ""
+
+	input_nodes_names = [ node.name[:-2] for node in net_model.inputs]
+	output_nodes_names = [ node.name[:-2] for node in net_model.outputs]
+
+	print ""
+	print "Inputs:", input_nodes_names
+	print "Outputs:", output_nodes_names
+	print ""
 
 	# get sesssion
 	sess = keras.backend.get_session()
 
 	output_folder = create_output_folder(ARGS.output_dir)
 
+	saver = tf.train.Saver(tf.global_variables())
+
 	if ARGS.ascii:
 		write_graph_def_in_ascii(sess, output_folder)
 
 	# freeze graph: trasnform variable placeholders into constants
-	constant_graph = graph_util.convert_variables_to_constants(sess, sess.graph.as_graph_def(), output_nodes_names)
+	constant_graph = graph_util.convert_variables_to_constants(sess, sess.graph.as_graph_def(), output_nodes_names)	
+	# save frozen graph
+	frozen_graph_name = "frozen_"+ARGS.output_name
+	graph_io.write_graph(constant_graph, output_folder, frozen_graph_name, as_text=False)
+	print('Saved frozen graph at: ', osp.join(output_folder, frozen_graph_name))
 
-	# optimze for inference, eliminate useless layes and other stuff
-	# this is requiered otherwise wont work with opencv dnn which doesnt have unnecesary layers implemented
-	constant_graph = optimize_for_inference(constant_graph, input_nodes_names, output_nodes_names, dtypes.float32.as_datatype_enum)
+
+	# Optimize for inference
+
+	# load frozen graph
+	input_graph_def = tf.GraphDef()
+	with tf.gfile.Open(os.path.join(output_folder, frozen_graph_name), "r") as f:
+	    data = f.read()
+	    input_graph_def.ParseFromString(data)
+		
+	# print node names
+	print ""
+	print "NODES"
+	print "====="
+	for node in input_graph_def.node:
+		print node.name
+	print ""
+
+	# optimze graph
+	output_graph_def = optimize_for_inference(
+	    input_graph_def,
+	    input_nodes_names, output_nodes_names, # an array of output nodes
+	    tf.float32.as_datatype_enum)
 
 	# save graph to output file
-	graph_io.write_graph(constant_graph, output_folder, ARGS.output_name, as_text=False)
-	print('Saved constant graph (ready for inference) at: ', osp.join(output_folder, ARGS.output_name))
+	optimized_graph_name = "optimized_"+ARGS.output_name
+	f = tf.gfile.FastGFile(os.path.join(output_folder, optimized_graph_name), "w")
+	f.write(output_graph_def.SerializeToString())
+	print('Saved optimized graph (ready for inference) at: ', osp.join(output_folder, optimized_graph_name))
 
